@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"time"
@@ -38,6 +39,14 @@ type produceFlags struct {
 	topic     string
 	count     int
 	keyPrefix string
+}
+
+type consumeFlags struct {
+	bootstrap     string
+	topic         string
+	group         string
+	count         int
+	fromBeginning bool
 }
 
 type orderEvent struct {
@@ -75,10 +84,14 @@ func run(args []string) error {
 			return fmt.Errorf("unknown topic command %q", args[1])
 		}
 	case "event":
-		if args[1] == "produce" {
+		switch args[1] {
+		case "produce":
 			return produceCommand(args[2:])
+		case "consume":
+			return consumeCommand(args[2:])
+		default:
+			return fmt.Errorf("unknown event command %q", args[1])
 		}
-		return fmt.Errorf("unknown event command %q", args[1])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -232,6 +245,106 @@ func produceCommand(args []string) error {
 		partitions[record.Partition]++
 	}
 	fmt.Printf("PRODUCED topic=%s count=%d partitions=%v\n", options.topic, len(records), partitions)
+	return nil
+}
+
+func parseConsumeFlags(args []string) (consumeFlags, error) {
+	fs := flag.NewFlagSet("event consume", flag.ContinueOnError)
+	bootstrap := fs.String("bootstrap", "", "Kafka bootstrap address")
+	topic := fs.String("topic", "", "Kafka topic")
+	group := fs.String("group", "", "Kafka consumer group")
+	count := fs.Int("count", 1, "number of events to consume")
+	fromBeginning := fs.Bool("from-beginning", false, "start at the earliest offset for a new group")
+	if err := fs.Parse(args); err != nil {
+		return consumeFlags{}, err
+	}
+	if fs.NArg() != 0 {
+		return consumeFlags{}, fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+	if *bootstrap == "" || *topic == "" || *group == "" {
+		return consumeFlags{}, fmt.Errorf("--bootstrap, --topic, and --group are required")
+	}
+	if *count < 1 {
+		return consumeFlags{}, fmt.Errorf("--count must be at least 1")
+	}
+
+	return consumeFlags{
+		bootstrap:     *bootstrap,
+		topic:         *topic,
+		group:         *group,
+		count:         *count,
+		fromBeginning: *fromBeginning,
+	}, nil
+}
+
+func consumeCommand(args []string) error {
+	options, err := parseConsumeFlags(args)
+	if err != nil {
+		return err
+	}
+
+	clientOptions := []kgo.Opt{
+		kgo.SeedBrokers(options.bootstrap),
+		kgo.ConsumerGroup(options.group),
+		kgo.ConsumeTopics(options.topic),
+		kgo.DisableAutoCommit(),
+		kgo.BlockRebalanceOnPoll(),
+	}
+	if options.fromBeginning {
+		clientOptions = append(clientOptions, kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	}
+
+	client, err := kgo.NewClient(clientOptions...)
+	if err != nil {
+		return fmt.Errorf("create Kafka consumer: %w", err)
+	}
+	defer client.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	processed := 0
+	for processed < options.count {
+		fetches := client.PollRecords(ctx, options.count-processed)
+		if fetches.IsClientClosed() {
+			return nil
+		}
+		if errs := fetches.Errors(); len(errs) > 0 {
+			return fmt.Errorf("fetch records: %v", errs)
+		}
+
+		var processErr error
+		fetches.EachPartition(func(partition kgo.FetchTopicPartition) {
+			if processErr != nil {
+				return
+			}
+
+			for _, record := range partition.Records {
+				var event orderEvent
+				if err := json.Unmarshal(record.Value, &event); err != nil {
+					processErr = fmt.Errorf("decode partition=%d offset=%d: %w", record.Partition, record.Offset, err)
+					return
+				}
+				if event.EventID == "" || event.Payload.OrderID == "" {
+					processErr = fmt.Errorf("invalid event partition=%d offset=%d", record.Partition, record.Offset)
+					return
+				}
+			}
+
+			if err := client.CommitRecords(ctx, partition.Records...); err != nil {
+				processErr = fmt.Errorf("commit partition=%d: %w", partition.Partition, err)
+				return
+			}
+			processed += len(partition.Records)
+		})
+
+		client.AllowRebalance()
+		if processErr != nil {
+			return processErr
+		}
+	}
+
+	fmt.Printf("CONSUMED topic=%s group=%s count=%d\n", options.topic, options.group, processed)
 	return nil
 }
 
