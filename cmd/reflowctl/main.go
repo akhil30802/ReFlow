@@ -42,11 +42,12 @@ type produceFlags struct {
 }
 
 type consumeFlags struct {
-	bootstrap     string
-	topic         string
-	group         string
-	count         int
-	fromBeginning bool
+	bootstrap            string
+	topic                string
+	group                string
+	count                int
+	fromBeginning        bool
+	crashAfterValidation bool
 }
 
 type orderEvent struct {
@@ -255,6 +256,7 @@ func parseConsumeFlags(args []string) (consumeFlags, error) {
 	group := fs.String("group", "", "Kafka consumer group")
 	count := fs.Int("count", 1, "number of events to consume")
 	fromBeginning := fs.Bool("from-beginning", false, "start at the earliest offset for a new group")
+	crashAfterValidation := fs.Bool("crash-after-validation", false, "exit after validation and before committing offsets")
 	if err := fs.Parse(args); err != nil {
 		return consumeFlags{}, err
 	}
@@ -269,11 +271,12 @@ func parseConsumeFlags(args []string) (consumeFlags, error) {
 	}
 
 	return consumeFlags{
-		bootstrap:     *bootstrap,
-		topic:         *topic,
-		group:         *group,
-		count:         *count,
-		fromBeginning: *fromBeginning,
+		bootstrap:            *bootstrap,
+		topic:                *topic,
+		group:                *group,
+		count:                *count,
+		fromBeginning:        *fromBeginning,
+		crashAfterValidation: *crashAfterValidation,
 	}, nil
 }
 
@@ -329,6 +332,11 @@ func consumeCommand(args []string) error {
 					processErr = fmt.Errorf("invalid event partition=%d offset=%d", record.Partition, record.Offset)
 					return
 				}
+			}
+
+			if options.crashAfterValidation {
+				fmt.Fprintf(os.Stderr, "FAILPOINT: exiting before commit partition=%d\n", partition.Partition)
+				os.Exit(42)
 			}
 
 			if err := client.CommitRecords(ctx, partition.Records...); err != nil {
